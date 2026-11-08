@@ -960,15 +960,41 @@ local function countWorkspace()
     return okD and #d or 0
 end
 
+UI.StreamDwell    = 0.35   -- detik menunggu di tiap titik supaya server sempat mengirim map
+UI.StreamTeleport = true   -- pindahkan karakter ke tiap titik (jauh lebih ampuh dari RequestStreamAroundAsync saja)
+UI.StreamLayers   = true   -- sapu juga lapisan ketinggian (untuk map gunung / bertingkat)
+UI.StreamKeep     = true   -- simpan referensi bagian map yang di-stream-out lalu pasang kembali sebelum disimpan
+UI.ActiveSession  = nil
+
+local function loadedBounds()
+    local mn = Vector3.new(math.huge, math.huge, math.huge)
+    local mx = Vector3.new(-math.huge, -math.huge, -math.huge)
+    local okD, d = pcall(workspace.GetDescendants, workspace)
+    local n = 0
+    for _, inst in ipairs(okD and d or {}) do
+        if inst:IsA("BasePart") and not inst:IsA("Terrain") then
+            local okP, pp = pcall(function() return inst.Position end)
+            if okP then
+                n += 1
+                mn = Vector3.new(math.min(mn.X, pp.X), math.min(mn.Y, pp.Y), math.min(mn.Z, pp.Z))
+                mx = Vector3.new(math.max(mx.X, pp.X), math.max(mx.Y, pp.Y), math.max(mx.Z, pp.Z))
+            end
+        end
+    end
+    if n == 0 then return nil end
+    return mn, mx
+end
+
 local function preloadStreaming(onStep)
     local okE, enabled = pcall(function() return workspace.StreamingEnabled end)
     if not (okE and enabled) then return false, 0, 0 end
     local lp = Players.LocalPlayer
     if not lp then return false, 0, 0 end
 
-    local center = Vector3.zero
     local ch = lp.Character
     local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    local home = hrp and hrp.CFrame
+    local center = Vector3.zero
     if hrp then
         center = hrp.Position
     elseif workspace.CurrentCamera then
@@ -981,26 +1007,92 @@ local function preloadStreaming(onStep)
         step = math.clamp(math.floor(targetR * 0.75), 64, step)
     end
 
+    -- pelacak: simpan referensi semua instance Workspace yang pernah ada, supaya yang di-stream-out
+    -- bisa dipasang kembali ke induknya sebelum saveinstance.
+    local added, parentOf, conn = {}, {}, nil
+    if UI.StreamKeep then
+        local okD, d = pcall(workspace.GetDescendants, workspace)
+        for _, inst in ipairs(okD and d or {}) do
+            added[#added + 1] = inst
+            parentOf[inst] = inst.Parent
+        end
+        conn = workspace.DescendantAdded:Connect(function(inst)
+            added[#added + 1] = inst
+            parentOf[inst] = inst.Parent
+        end)
+    end
+
+    local canTP = UI.StreamTeleport and hrp ~= nil
+    local wasAnchored = false
+    if canTP then
+        wasAnchored = hrp.Anchored
+        pcall(function() hrp.Anchored = true end)
+    end
+
+    local session = {}
+    function session.restore()
+        local restored, lost = 0, 0
+        for i = 1, #added do
+            local inst = added[i]
+            local okP, par = pcall(function() return inst.Parent end)
+            if okP and par == nil then
+                local want = parentOf[inst]
+                local isChar = want == workspace and inst:IsA("Model") and inst:FindFirstChildWhichIsA("Humanoid") ~= nil
+                if want and want ~= inst and not isChar then
+                    local okS = pcall(function() inst.Parent = want end)
+                    local okC, nowP = pcall(function() return inst.Parent end)
+                    if okS and okC and nowP == want then restored += 1 else lost += 1 end
+                end
+            end
+            if i % 3000 == 0 then task.wait() end
+        end
+        return restored, lost
+    end
+    function session.finish()
+        if conn then conn:Disconnect(); conn = nil end
+        if canTP and hrp and hrp.Parent then
+            pcall(function()
+                hrp.CFrame = home
+                hrp.Anchored = wasAnchored
+            end)
+        end
+        added, parentOf = {}, {}
+    end
+    UI.ActiveSession = session
+
     -- RequestStreamAroundAsync kadang tidak pernah kembali; jalankan di thread terpisah
-    -- dan lanjut setelah 4 detik supaya sapuan tidak macet.
-    local stuck = 0
+    local firstErr, stuck = nil, 0
     local function visit(pos)
         local finished = false
         task.spawn(function()
-            pcall(function() lp:RequestStreamAroundAsync(pos, 1.5) end)
+            local okV, e = pcall(function() lp:RequestStreamAroundAsync(pos, 1.5) end)
+            if not okV and not firstErr then firstErr = tostring(e) end
             finished = true
         end)
         local t = os.clock()
         while not finished and os.clock() - t < 4 do task.wait(0.05) end
         if finished then stuck = 0 else stuck += 1 end
     end
+    local function moveTo(pos)
+        if canTP and hrp.Parent then
+            pcall(function()
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.CFrame = CFrame.new(pos)
+            end)
+        end
+        visit(pos)
+        task.wait(UI.StreamDwell)
+    end
+    local function stopped(t0)
+        return not gui.Parent or UI.StreamAbort or os.clock() - t0 > UI.StreamMaxSeconds
+    end
 
     local t0 = os.clock()
-    visit(center)
+    moveTo(center)
     local best, idle, rings, visited = countWorkspace(), 0, 0, 1
     local k = 1
     while k * step <= UI.StreamMaxRadius do
-        if not gui.Parent or UI.StreamAbort or os.clock() - t0 > UI.StreamMaxSeconds then break end
+        if stopped(t0) then break end
         local pts = {}
         for i = -k, k do
             if math.abs(i) == k then
@@ -1011,10 +1103,10 @@ local function preloadStreaming(onStep)
             end
         end
         for _, off in ipairs(pts) do
-            if not gui.Parent or UI.StreamAbort or os.clock() - t0 > UI.StreamMaxSeconds then break end
-            visit(center + off)
+            if stopped(t0) then break end
+            moveTo(center + off)
             visited += 1
-            if stuck >= 8 then break end   -- server tidak menjawab 8 titik berturut-turut
+            if stuck >= 8 then break end
         end
         rings = k
         local now = countWorkspace()
@@ -1023,9 +1115,37 @@ local function preloadStreaming(onStep)
         if idle >= UI.StreamIdleRings or stuck >= 8 then break end
         k += 1
     end
-    visit(center)
-    task.wait(0.5)
-    return true, rings, best
+
+    -- lapisan ketinggian: map bertingkat/gunung butuh titik di atas & bawah posisi awal
+    if UI.StreamLayers and not stopped(t0) then
+        local mn, mx = loadedBounds()
+        if mn then
+            local ys = {}
+            local y = center.Y + step
+            while y - step < mx.Y and #ys < 12 do ys[#ys + 1] = y; y += step end
+            y = center.Y - step
+            while y + step > mn.Y and #ys < 24 do ys[#ys + 1] = y; y -= step end
+            local gstep = step * 1.2
+            local layerPts = 0
+            for li, ly in ipairs(ys) do
+                if stopped(t0) or stuck >= 8 then break end
+                local x = mn.X - step
+                while x <= mx.X + step and layerPts < 900 do
+                    local z = mn.Z - step
+                    while z <= mx.Z + step and layerPts < 900 do
+                        if stopped(t0) then break end
+                        moveTo(Vector3.new(x, ly, z))
+                        layerPts += 1
+                        visited += 1
+                        z += gstep
+                    end
+                    x += gstep
+                end
+                if onStep then onStep(rings, countWorkspace(), visited, os.clock() - t0) end
+            end
+        end
+    end
+    return true, rings, best, firstErr
 end
 
 ---------------------------------------------------------------------
@@ -1045,23 +1165,40 @@ local function cleanText(str)
     return str
 end
 
-local function grabSource(scr)
-    local out
-    local okS, r = pcall(function() return scr.Source end)
-    if okS and type(r) == "string" and r ~= "" then out = r end
-    if not out and type(decompile) == "function" then
-        local okD, r2 = pcall(decompile, scr)
-        if okD and type(r2) == "string" and r2 ~= "" then out = r2 end
-    end
-    if not out and type(gethiddenproperty) == "function" then
-        local okH, r3 = pcall(gethiddenproperty, scr, "Source")
-        if okH and type(r3) == "string" and r3 ~= "" then out = r3 end
-    end
-    return out
+local function looksFailed(str)
+    if #str > 600 then return false end
+    local low = str:lower()
+    return low:find("not found", 1, true) ~= nil
+        or low:find("failed to decompile", 1, true) ~= nil
+        or low:find("decompile failed", 1, true) ~= nil
+        or low:find("decompilation failed", 1, true) ~= nil
+        or low:find("unable to decompile", 1, true) ~= nil
+        or low:find("cannot decompile", 1, true) ~= nil
 end
 
--- return: jumlah script, jumlah yang berhasil dibaca isinya
-function ScriptKit.harvest(instances, report, outPath)
+local function grabSource(scr)
+    local placeholder = false
+    local function ok(r)
+        if type(r) ~= "string" or r == "" then return false end
+        if looksFailed(r) then placeholder = true return false end
+        return true
+    end
+    local okS, r = pcall(function() return scr.Source end)
+    if okS and ok(r) then return r end
+    if type(decompile) == "function" then
+        local okD, r2 = pcall(decompile, scr)
+        if okD and ok(r2) then return r2 end
+    end
+    if type(gethiddenproperty) == "function" then
+        local okH, r3 = pcall(gethiddenproperty, scr, "Source")
+        if okH and ok(r3) then return r3 end
+    end
+    if placeholder then return nil, "placeholder" end
+    if type(decompile) ~= "function" then return nil, "tanpa_decompile" end
+    return nil, "kosong"
+end
+
+function ScriptKit.harvest(instances, report, outPath, exportDir)
     local list, counter = {}, {}
     for _, svc in ipairs(instances) do
         local okD, d = pcall(svc.GetDescendants, svc)
@@ -1088,7 +1225,7 @@ function ScriptKit.harvest(instances, report, outPath)
             nextI += 1
             local finished = false
             task.spawn(function()
-                e.src = grabSource(e.inst)
+                e.src, e.why = grabSource(e.inst)
                 finished = true
             end)
             local t1 = os.clock()
@@ -1107,12 +1244,54 @@ function ScriptKit.harvest(instances, report, outPath)
     end
 
     local out, good = {}, 0
+    local tally = {}
     for _, e in ipairs(list) do
+        local t = tally[e.class]
+        if not t then t = {0, 0}; tally[e.class] = t end
+        t[2] += 1
         if e.src then
             good += 1
+            t[1] += 1
             out[#out + 1] = {k = e.key, c = e.class, n = e.name, s = cleanText(e.src)}
         end
     end
+    local parts = {}
+    for _, cls in ipairs({"LocalScript", "ModuleScript", "Script"}) do
+        local t = tally[cls]
+        if t then
+            parts[#parts + 1] = ((cls == "Script") and "Script(server)" or cls) .. " " .. t[1] .. "/" .. t[2]
+        end
+    end
+    local statText = table.concat(parts, " • ")
+    local why = {placeholder = 0, tanpa_decompile = 0, kosong = 0, timeout = 0}
+    for _, e in ipairs(list) do
+        if not e.src then
+            local w = e.why or "timeout"
+            why[w] = (why[w] or 0) + 1
+        end
+    end
+    local diag = {}
+    if why.tanpa_decompile > 0 then diag[#diag + 1] = why.tanpa_decompile .. " executor tanpa decompile" end
+    if why.placeholder > 0 then diag[#diag + 1] = why.placeholder .. " hasil decompile 'not found/failed'" end
+    if why.kosong > 0 then diag[#diag + 1] = why.kosong .. " kosong (tidak ada bytecode di client)" end
+    if why.timeout > 0 then diag[#diag + 1] = why.timeout .. " timeout" end
+    if #diag > 0 then statText = statText .. " | gagal: " .. table.concat(diag, ", ") end
+
+    -- ekspor tiap script yang terbaca sebagai file .lua (cadangan kalau pemasangan ke script ditolak)
+    local exported = 0
+    if good > 0 and exportDir and type(writefile) == "function" then
+        if type(makefolder) == "function" then pcall(makefolder, exportDir) end
+        for i, e in ipairs(list) do
+            if e.src then
+                local safe = (e.key:gsub("#", "_"):gsub("[^%w%._%-]", "_"))
+                if #safe > 90 then safe = safe:sub(-90) end
+                local ext = (e.class == "ModuleScript") and ".module.lua" or ((e.class == "LocalScript") and ".client.lua" or ".server.lua")
+                local okW = pcall(writefile, exportDir .. "/" .. string.format("%04d_", i) .. safe .. ext, cleanText(e.src))
+                if okW then exported += 1 end
+            end
+        end
+    end
+    statText = statText .. (exported > 0 and (" | " .. exported .. " file .lua di folder " .. exportDir) or "")
     if good > 0 then
         local okJ, js = pcall(function()
             return game:GetService("HttpService"):JSONEncode({v = 1, scripts = out})
@@ -1124,7 +1303,7 @@ function ScriptKit.harvest(instances, report, outPath)
             pcall(warn, "[CopyMap] JSONEncode script gagal: " .. tostring(js))
         end
     end
-    return total, good
+    return total, good, statText
 end
 
 UI.OnCopy = function(services, fileName)
@@ -1132,7 +1311,14 @@ UI.OnCopy = function(services, fileName)
     busy = true
     barFill.BackgroundColor3 = T.Accent
 
+    local function endSession()
+        local sess = UI.ActiveSession
+        UI.ActiveSession = nil
+        if sess then pcall(sess.finish) end
+    end
+
     local function fail(title, sub)
+        endSession()
         running = false
         barFill.BackgroundColor3 = T.Bad
         UI.SetProgress(100, title, sub)
@@ -1152,9 +1338,9 @@ UI.OnCopy = function(services, fileName)
     if table.find(services, "Workspace") then
         local before = countWorkspace()
         UI.StreamAbort = false
-        local sweepDone, okP, did, rings, peak = false, false, false, 0, nil
+        local sweepDone, okP, did, rings, peak, serr = false, false, false, 0, nil, nil
         task.spawn(function()
-            okP, did, rings, peak = pcall(preloadStreaming, function(k, now, visited, secs)
+            okP, did, rings, peak, serr = pcall(preloadStreaming, function(k, now, visited, secs)
                 UI.SetProgress(3 + 7 * (1 - math.exp(-k / 12)), "Memuat seluruh area map (streaming)...",
                     "cincin " .. k .. " • " .. fmt(now) .. " item • " .. fmt(visited) .. " titik • " .. mmss(secs))
             end)
@@ -1170,8 +1356,18 @@ UI.OnCopy = function(services, fileName)
             okP, did, rings = true, true, rings or 0
             pcall(warn, "[CopyMap] sapuan streaming dihentikan watchdog, lanjut menyimpan")
         end
+        if not okP then
+            pcall(warn, "[CopyMap] sapuan streaming error: " .. tostring(did))
+        end
         if okP and did then
             streamed = true
+            -- pasang kembali bagian map yang sempat di-stream-out selama sapuan
+            local restored, lost = 0, 0
+            if UI.ActiveSession then
+                UI.SetProgress(10, "Memulihkan bagian map...", "memasang kembali part yang ter-stream-out")
+                local okRs, r1, r2 = pcall(UI.ActiveSession.restore)
+                if okRs then restored, lost = r1 or 0, r2 or 0 end
+            end
             local after = countWorkspace()
             info.Workspace = info.Workspace or {items = 0, scripts = 0}
             info.Workspace.items = after
@@ -1181,7 +1377,10 @@ UI.OnCopy = function(services, fileName)
                 if inst:IsA("LuaSourceContainer") then sc += 1 end
             end
             info.Workspace.scripts = sc
-            streamNote = "streaming: " .. fmt(before) .. " -> " .. fmt(after) .. " item (" .. tostring(rings) .. " cincin)"
+            streamNote = "streaming: " .. fmt(before) .. " -> " .. fmt(after) .. " item (" .. tostring(rings) .. " cincin"
+                .. ((restored > 0 or lost > 0) and (", dipulihkan " .. fmt(restored) .. ((lost > 0) and (", gagal " .. fmt(lost)) or "")) or "")
+                .. ")"
+            if serr then streamNote ..= " • RequestStream error: " .. shortErr(serr, 60) end
             pcall(warn, "[CopyMap] " .. streamNote .. " | puncak " .. fmt(peak or after))
         end
     end
@@ -1217,17 +1416,21 @@ UI.OnCopy = function(services, fileName)
     -- 1b) baca isi semua script sendiri -> <nama>.scripts.json (dipakai saat import)
     local scriptNote, base = nil, 10
     if type(writefile) == "function" then
-        local okH, tot, good = pcall(ScriptKit.harvest, instances, function(done, total)
+        local okH, tot, good, stat = pcall(ScriptKit.harvest, instances, function(done, total)
             UI.SetProgress(10 + 15 * (done / math.max(1, total)), "Membaca isi script...",
                 done .. " / " .. total .. " script")
-        end, fileName .. ".scripts.json")
+        end, fileName .. ".scripts.json", fileName .. "_scripts")
         if okH and tot and tot > 0 then
-            scriptNote = good .. "/" .. tot .. " isi script disimpan ke " .. fileName .. ".scripts.json"
+            scriptNote = good .. "/" .. tot .. " isi script terbaca (" .. tostring(stat) .. ")"
+            if good > 0 then scriptNote ..= " -> " .. fileName .. ".scripts.json" end
+            if good < tot then scriptNote ..= " | sisanya tidak bisa dibaca dari client (Script server tidak punya isi di client)" end
             base = 25
         elseif not okH then
             pcall(warn, "[CopyMap] baca script gagal: " .. tostring(tot))
         end
     end
+
+    if UI.ActiveSession then pcall(UI.ActiveSession.restore) end
 
     -- 2) jalankan saveinstance (urutan percobaan dari yang paling lengkap)
     local path = fileName .. ".rbxl"
@@ -1278,6 +1481,7 @@ UI.OnCopy = function(services, fileName)
         UI.SetProgress(p, "Menyimpan map...", note)
         task.wait(0.3)
     end
+    endSession()
     if not gui.Parent then busy = false return end
 
     -- 4) hasil
