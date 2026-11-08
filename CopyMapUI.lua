@@ -951,12 +951,38 @@ end
 -- sapuan berhenti kalau beberapa cincin berturut-turut tidak menambah item lagi (ujung map) atau waktu habis.
 UI.StreamStep       = 512       -- jarak antar titik (stud); otomatis dikecilkan kalau radius streaming game kecil
 UI.StreamIdleRings  = 6         -- berhenti setelah sekian cincin berturut-turut tanpa item baru
-UI.StreamMaxSeconds = 900       -- batas waktu total (detik)
+UI.StreamMaxSeconds = 600       -- batas waktu total sapuan (detik), dijaga watchdog
+UI.StreamAbort      = false     -- diset true oleh watchdog kalau sapuan macet
 UI.StreamMaxRadius  = 1000000   -- batas jarak (stud), praktis tak terbatas
 
 local function countWorkspace()
     local okD, d = pcall(workspace.GetDescendants, workspace)
     return okD and #d or 0
+end
+
+UI.StreamDwell    = 0.35   -- detik menunggu di tiap titik supaya server sempat mengirim map
+UI.StreamTeleport = true   -- pindahkan karakter ke tiap titik (jauh lebih ampuh dari RequestStreamAroundAsync saja)
+UI.StreamLayers   = true   -- sapu juga lapisan ketinggian (untuk map gunung / bertingkat)
+UI.StreamKeep     = true   -- simpan referensi bagian map yang di-stream-out lalu pasang kembali sebelum disimpan
+UI.ActiveSession  = nil
+
+local function loadedBounds()
+    local mn = Vector3.new(math.huge, math.huge, math.huge)
+    local mx = Vector3.new(-math.huge, -math.huge, -math.huge)
+    local okD, d = pcall(workspace.GetDescendants, workspace)
+    local n = 0
+    for _, inst in ipairs(okD and d or {}) do
+        if inst:IsA("BasePart") and not inst:IsA("Terrain") then
+            local okP, pp = pcall(function() return inst.Position end)
+            if okP then
+                n += 1
+                mn = Vector3.new(math.min(mn.X, pp.X), math.min(mn.Y, pp.Y), math.min(mn.Z, pp.Z))
+                mx = Vector3.new(math.max(mx.X, pp.X), math.max(mx.Y, pp.Y), math.max(mx.Z, pp.Z))
+            end
+        end
+    end
+    if n == 0 then return nil end
+    return mn, mx
 end
 
 local function preloadStreaming(onStep)
@@ -965,9 +991,10 @@ local function preloadStreaming(onStep)
     local lp = Players.LocalPlayer
     if not lp then return false, 0, 0 end
 
-    local center = Vector3.zero
     local ch = lp.Character
     local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+    local home = hrp and hrp.CFrame
+    local center = Vector3.zero
     if hrp then
         center = hrp.Position
     elseif workspace.CurrentCamera then
@@ -980,16 +1007,92 @@ local function preloadStreaming(onStep)
         step = math.clamp(math.floor(targetR * 0.75), 64, step)
     end
 
+    -- pelacak: simpan referensi semua instance Workspace yang pernah ada, supaya yang di-stream-out
+    -- bisa dipasang kembali ke induknya sebelum saveinstance.
+    local added, parentOf, conn = {}, {}, nil
+    if UI.StreamKeep then
+        local okD, d = pcall(workspace.GetDescendants, workspace)
+        for _, inst in ipairs(okD and d or {}) do
+            added[#added + 1] = inst
+            parentOf[inst] = inst.Parent
+        end
+        conn = workspace.DescendantAdded:Connect(function(inst)
+            added[#added + 1] = inst
+            parentOf[inst] = inst.Parent
+        end)
+    end
+
+    local canTP = UI.StreamTeleport and hrp ~= nil
+    local wasAnchored = false
+    if canTP then
+        wasAnchored = hrp.Anchored
+        pcall(function() hrp.Anchored = true end)
+    end
+
+    local session = {}
+    function session.restore()
+        local restored, lost = 0, 0
+        for i = 1, #added do
+            local inst = added[i]
+            local okP, par = pcall(function() return inst.Parent end)
+            if okP and par == nil then
+                local want = parentOf[inst]
+                local isChar = want == workspace and inst:IsA("Model") and inst:FindFirstChildWhichIsA("Humanoid") ~= nil
+                if want and want ~= inst and not isChar then
+                    local okS = pcall(function() inst.Parent = want end)
+                    local okC, nowP = pcall(function() return inst.Parent end)
+                    if okS and okC and nowP == want then restored += 1 else lost += 1 end
+                end
+            end
+            if i % 3000 == 0 then task.wait() end
+        end
+        return restored, lost
+    end
+    function session.finish()
+        if conn then conn:Disconnect(); conn = nil end
+        if canTP and hrp and hrp.Parent then
+            pcall(function()
+                hrp.CFrame = home
+                hrp.Anchored = wasAnchored
+            end)
+        end
+        added, parentOf = {}, {}
+    end
+    UI.ActiveSession = session
+
+    -- RequestStreamAroundAsync kadang tidak pernah kembali; jalankan di thread terpisah
+    local firstErr, stuck = nil, 0
     local function visit(pos)
-        pcall(function() lp:RequestStreamAroundAsync(pos, 1.5) end)
+        local finished = false
+        task.spawn(function()
+            local okV, e = pcall(function() lp:RequestStreamAroundAsync(pos, 1.5) end)
+            if not okV and not firstErr then firstErr = tostring(e) end
+            finished = true
+        end)
+        local t = os.clock()
+        while not finished and os.clock() - t < 4 do task.wait(0.05) end
+        if finished then stuck = 0 else stuck += 1 end
+    end
+    local function moveTo(pos)
+        if canTP and hrp.Parent then
+            pcall(function()
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.CFrame = CFrame.new(pos)
+            end)
+        end
+        visit(pos)
+        task.wait(UI.StreamDwell)
+    end
+    local function stopped(t0)
+        return not gui.Parent or UI.StreamAbort or os.clock() - t0 > UI.StreamMaxSeconds
     end
 
     local t0 = os.clock()
-    visit(center)
+    moveTo(center)
     local best, idle, rings, visited = countWorkspace(), 0, 0, 1
     local k = 1
     while k * step <= UI.StreamMaxRadius do
-        if not gui.Parent or os.clock() - t0 > UI.StreamMaxSeconds then break end
+        if stopped(t0) then break end
         local pts = {}
         for i = -k, k do
             if math.abs(i) == k then
@@ -1000,20 +1103,49 @@ local function preloadStreaming(onStep)
             end
         end
         for _, off in ipairs(pts) do
-            if not gui.Parent or os.clock() - t0 > UI.StreamMaxSeconds then break end
-            visit(center + off)
+            if stopped(t0) then break end
+            moveTo(center + off)
             visited += 1
+            if stuck >= 8 then break end
         end
         rings = k
         local now = countWorkspace()
         if now > best then best = now; idle = 0 else idle += 1 end
         if onStep then onStep(k, now, visited, os.clock() - t0) end
-        if idle >= UI.StreamIdleRings then break end
+        if idle >= UI.StreamIdleRings or stuck >= 8 then break end
         k += 1
     end
-    visit(center)
-    task.wait(0.5)
-    return true, rings, best
+
+    -- lapisan ketinggian: map bertingkat/gunung butuh titik di atas & bawah posisi awal
+    if UI.StreamLayers and not stopped(t0) then
+        local mn, mx = loadedBounds()
+        if mn then
+            local ys = {}
+            local y = center.Y + step
+            while y - step < mx.Y and #ys < 12 do ys[#ys + 1] = y; y += step end
+            y = center.Y - step
+            while y + step > mn.Y and #ys < 24 do ys[#ys + 1] = y; y -= step end
+            local gstep = step * 1.2
+            local layerPts = 0
+            for li, ly in ipairs(ys) do
+                if stopped(t0) or stuck >= 8 then break end
+                local x = mn.X - step
+                while x <= mx.X + step and layerPts < 900 do
+                    local z = mn.Z - step
+                    while z <= mx.Z + step and layerPts < 900 do
+                        if stopped(t0) then break end
+                        moveTo(Vector3.new(x, ly, z))
+                        layerPts += 1
+                        visited += 1
+                        z += gstep
+                    end
+                    x += gstep
+                end
+                if onStep then onStep(rings, countWorkspace(), visited, os.clock() - t0) end
+            end
+        end
+    end
+    return true, rings, best, firstErr
 end
 
 ---------------------------------------------------------------------
@@ -1033,22 +1165,32 @@ local function cleanText(str)
     return str
 end
 
-local function grabSource(scr)
-    local out
-    local okS, r = pcall(function() return scr.Source end)
-    if okS and type(r) == "string" and r ~= "" then out = r end
-    if not out and type(decompile) == "function" then
-        local okD, r2 = pcall(decompile, scr)
-        if okD and type(r2) == "string" and r2 ~= "" then out = r2 end
-    end
-    if not out and type(gethiddenproperty) == "function" then
-        local okH, r3 = pcall(gethiddenproperty, scr, "Source")
-        if okH and type(r3) == "string" and r3 ~= "" then out = r3 end
-    end
-    return out
+local function looksFailed(str)
+    if #str > 600 then return false end
+    local low = str:lower()
+    return low:find("not found", 1, true) ~= nil
+        or low:find("failed to decompile", 1, true) ~= nil
+        or low:find("decompile failed", 1, true) ~= nil
+        or low:find("decompilation failed", 1, true) ~= nil
+        or low:find("unable to decompile", 1, true) ~= nil
+        or low:find("cannot decompile", 1, true) ~= nil
 end
 
--- return: jumlah script, jumlah yang berhasil dibaca isinya
+local function grabSource(scr)
+    local function ok(r) return type(r) == "string" and r ~= "" and not looksFailed(r) end
+    local okS, r = pcall(function() return scr.Source end)
+    if okS and ok(r) then return r end
+    if type(decompile) == "function" then
+        local okD, r2 = pcall(decompile, scr)
+        if okD and ok(r2) then return r2 end
+    end
+    if type(gethiddenproperty) == "function" then
+        local okH, r3 = pcall(gethiddenproperty, scr, "Source")
+        if okH and ok(r3) then return r3 end
+    end
+    return nil
+end
+
 function ScriptKit.harvest(instances, report, outPath)
     local list, counter = {}, {}
     for _, svc in ipairs(instances) do
@@ -1095,12 +1237,25 @@ function ScriptKit.harvest(instances, report, outPath)
     end
 
     local out, good = {}, 0
+    local tally = {}
     for _, e in ipairs(list) do
+        local t = tally[e.class]
+        if not t then t = {0, 0}; tally[e.class] = t end
+        t[2] += 1
         if e.src then
             good += 1
+            t[1] += 1
             out[#out + 1] = {k = e.key, c = e.class, n = e.name, s = cleanText(e.src)}
         end
     end
+    local parts = {}
+    for _, cls in ipairs({"LocalScript", "ModuleScript", "Script"}) do
+        local t = tally[cls]
+        if t then
+            parts[#parts + 1] = ((cls == "Script") and "Script(server)" or cls) .. " " .. t[1] .. "/" .. t[2]
+        end
+    end
+    local statText = table.concat(parts, " • ")
     if good > 0 then
         local okJ, js = pcall(function()
             return game:GetService("HttpService"):JSONEncode({v = 1, scripts = out})
@@ -1112,7 +1267,7 @@ function ScriptKit.harvest(instances, report, outPath)
             pcall(warn, "[CopyMap] JSONEncode script gagal: " .. tostring(js))
         end
     end
-    return total, good
+    return total, good, statText
 end
 
 UI.OnCopy = function(services, fileName)
@@ -1120,7 +1275,14 @@ UI.OnCopy = function(services, fileName)
     busy = true
     barFill.BackgroundColor3 = T.Accent
 
+    local function endSession()
+        local sess = UI.ActiveSession
+        UI.ActiveSession = nil
+        if sess then pcall(sess.finish) end
+    end
+
     local function fail(title, sub)
+        endSession()
         running = false
         barFill.BackgroundColor3 = T.Bad
         UI.SetProgress(100, title, sub)
@@ -1139,12 +1301,37 @@ UI.OnCopy = function(services, fileName)
     local streamed, streamNote = false, nil
     if table.find(services, "Workspace") then
         local before = countWorkspace()
-        local okP, did, rings, peak = pcall(preloadStreaming, function(k, now, visited, secs)
-            UI.SetProgress(3 + 7 * (1 - math.exp(-k / 12)), "Memuat seluruh area map (streaming)...",
-                "cincin " .. k .. " • " .. fmt(now) .. " item • " .. fmt(visited) .. " titik • " .. mmss(secs))
+        UI.StreamAbort = false
+        local sweepDone, okP, did, rings, peak, serr = false, false, false, 0, nil, nil
+        task.spawn(function()
+            okP, did, rings, peak, serr = pcall(preloadStreaming, function(k, now, visited, secs)
+                UI.SetProgress(3 + 7 * (1 - math.exp(-k / 12)), "Memuat seluruh area map (streaming)...",
+                    "cincin " .. k .. " • " .. fmt(now) .. " item • " .. fmt(visited) .. " titik • " .. mmss(secs))
+            end)
+            sweepDone = true
         end)
+        -- watchdog: kalau sapuan melewati batas waktu, hentikan dan lanjut menyimpan
+        local sweepT0 = os.clock()
+        while not sweepDone and gui.Parent and os.clock() - sweepT0 < UI.StreamMaxSeconds + 15 do
+            task.wait(0.25)
+        end
+        if not sweepDone then
+            UI.StreamAbort = true
+            okP, did, rings = true, true, rings or 0
+            pcall(warn, "[CopyMap] sapuan streaming dihentikan watchdog, lanjut menyimpan")
+        end
+        if not okP then
+            pcall(warn, "[CopyMap] sapuan streaming error: " .. tostring(did))
+        end
         if okP and did then
             streamed = true
+            -- pasang kembali bagian map yang sempat di-stream-out selama sapuan
+            local restored, lost = 0, 0
+            if UI.ActiveSession then
+                UI.SetProgress(10, "Memulihkan bagian map...", "memasang kembali part yang ter-stream-out")
+                local okRs, r1, r2 = pcall(UI.ActiveSession.restore)
+                if okRs then restored, lost = r1 or 0, r2 or 0 end
+            end
             local after = countWorkspace()
             info.Workspace = info.Workspace or {items = 0, scripts = 0}
             info.Workspace.items = after
@@ -1154,7 +1341,10 @@ UI.OnCopy = function(services, fileName)
                 if inst:IsA("LuaSourceContainer") then sc += 1 end
             end
             info.Workspace.scripts = sc
-            streamNote = "streaming: " .. fmt(before) .. " -> " .. fmt(after) .. " item (" .. tostring(rings) .. " cincin)"
+            streamNote = "streaming: " .. fmt(before) .. " -> " .. fmt(after) .. " item (" .. tostring(rings) .. " cincin"
+                .. ((restored > 0 or lost > 0) and (", dipulihkan " .. fmt(restored) .. ((lost > 0) and (", gagal " .. fmt(lost)) or "")) or "")
+                .. ")"
+            if serr then streamNote ..= " • RequestStream error: " .. shortErr(serr, 60) end
             pcall(warn, "[CopyMap] " .. streamNote .. " | puncak " .. fmt(peak or after))
         end
     end
@@ -1190,17 +1380,20 @@ UI.OnCopy = function(services, fileName)
     -- 1b) baca isi semua script sendiri -> <nama>.scripts.json (dipakai saat import)
     local scriptNote, base = nil, 10
     if type(writefile) == "function" then
-        local okH, tot, good = pcall(ScriptKit.harvest, instances, function(done, total)
+        local okH, tot, good, stat = pcall(ScriptKit.harvest, instances, function(done, total)
             UI.SetProgress(10 + 15 * (done / math.max(1, total)), "Membaca isi script...",
                 done .. " / " .. total .. " script")
         end, fileName .. ".scripts.json")
         if okH and tot and tot > 0 then
-            scriptNote = good .. "/" .. tot .. " isi script disimpan ke " .. fileName .. ".scripts.json"
+            scriptNote = good .. "/" .. tot .. " isi script terbaca (" .. tostring(stat) .. ") -> " .. fileName .. ".scripts.json"
+            if good < tot then scriptNote ..= " | sisanya tidak bisa dibaca dari client (Script server tidak punya isi di client)" end
             base = 25
         elseif not okH then
             pcall(warn, "[CopyMap] baca script gagal: " .. tostring(tot))
         end
     end
+
+    if UI.ActiveSession then pcall(UI.ActiveSession.restore) end
 
     -- 2) jalankan saveinstance (urutan percobaan dari yang paling lengkap)
     local path = fileName .. ".rbxl"
@@ -1251,6 +1444,7 @@ UI.OnCopy = function(services, fileName)
         UI.SetProgress(p, "Menyimpan map...", note)
         task.wait(0.3)
     end
+    endSession()
     if not gui.Parent then busy = false return end
 
     -- 4) hasil
